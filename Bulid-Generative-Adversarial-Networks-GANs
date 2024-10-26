@@ -1,0 +1,145 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torchvision.datasets as datasets
+import torchvision.transforms as transforms
+import torchvision.utils as vutils
+import matplotlib.pyplot as plt
+
+# Set device and random seed for reproducibility
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+torch.manual_seed(999)
+
+# Hyperparameters
+batch_size = 64
+image_size = 64
+nz = 100  # Latent vector size
+ngf = 64  # Generator feature map size
+ndf = 64  # Discriminator feature map size
+nc = 1    # Number of channels in the training images (1 for grayscale images)
+num_epochs = 50
+lr = 0.0001  # Reduced learning rate
+beta1 = 0.5  # Beta1 hyperparam for Adam
+
+# Data preparation (MNIST dataset)
+transform = transforms.Compose([
+    transforms.Resize(image_size),
+    transforms.ToTensor(),
+    transforms.Normalize([0.5], [0.5])
+])
+dataset = datasets.MNIST(root='./data', download=True, transform=transform)
+dataloader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=True)
+
+# Weight Initialization
+def weights_init(m):
+    classname = m.__class__.__name__
+    if classname.find('Conv') != -1:
+        nn.init.normal_(m.weight.data, 0.0, 0.02)
+    elif classname.find('BatchNorm') != -1:
+        nn.init.normal_(m.weight.data, 1.0, 0.02)
+        nn.init.constant_(m.bias.data, 0)
+
+# Generator
+class Generator(nn.Module):
+    def __init__(self):
+        super(Generator, self).__init__()
+        self.main = nn.Sequential(
+            nn.ConvTranspose2d(nz, ngf * 8, 4, 1, 0, bias=False),
+            nn.BatchNorm2d(ngf * 8),
+            nn.ReLU(True),
+            nn.ConvTranspose2d(ngf * 8, ngf * 4, 4, 2, 1, bias=False),
+            nn.BatchNorm2d(ngf * 4),
+            nn.ReLU(True),
+            nn.ConvTranspose2d(ngf * 4, ngf * 2, 4, 2, 1, bias=False),
+            nn.BatchNorm2d(ngf * 2),
+            nn.ReLU(True),
+            nn.ConvTranspose2d(ngf * 2, ngf, 4, 2, 1, bias=False),
+            nn.BatchNorm2d(ngf),
+            nn.ReLU(True),
+            nn.ConvTranspose2d(ngf, nc, 4, 2, 1, bias=False),
+            nn.Tanh()
+        )
+
+    def forward(self, input):
+        return self.main(input)
+
+# Discriminator with spectral normalization
+class Discriminator(nn.Module):
+    def __init__(self):
+        super(Discriminator, self).__init__()
+        self.main = nn.Sequential(
+            nn.utils.spectral_norm(nn.Conv2d(nc, ndf, 4, 2, 1, bias=False)),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.utils.spectral_norm(nn.Conv2d(ndf, ndf * 2, 4, 2, 1, bias=False)),
+            nn.BatchNorm2d(ndf * 2),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.utils.spectral_norm(nn.Conv2d(ndf * 2, ndf * 4, 4, 2, 1, bias=False)),
+            nn.BatchNorm2d(ndf * 4),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.utils.spectral_norm(nn.Conv2d(ndf * 4, ndf * 8, 4, 2, 1, bias=False)),
+            nn.BatchNorm2d(ndf * 8),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(ndf * 8, 1, 4, 1, 0, bias=False),
+            nn.Sigmoid()
+        )
+
+    def forward(self, input):
+        return self.main(input)
+
+# Create models and move to device
+netG = Generator().to(device)
+netG.apply(weights_init)
+netD = Discriminator().to(device)
+netD.apply(weights_init)
+
+# Loss function and optimizers
+criterion = nn.BCELoss()
+fixed_noise = torch.randn(batch_size, nz, 1, 1, device=device)
+real_label = 0.9  # Label smoothing for real
+fake_label = 0.0
+optimizerD = optim.Adam(netD.parameters(), lr=lr, betas=(beta1, 0.999))
+optimizerG = optim.Adam(netG.parameters(), lr=lr, betas=(beta1, 0.999))
+
+# Training loop
+for epoch in range(num_epochs):
+    for i, data in enumerate(dataloader, 0):
+        ############################
+        # Update Discriminator
+        ############################
+        netD.zero_grad()
+        # Real data
+        real_data = data[0].to(device)
+        label = torch.full((real_data.size(0),), real_label, dtype=torch.float, device=device)
+        output = netD(real_data).view(-1)
+        lossD_real = criterion(output, label)
+        lossD_real.backward()
+
+        # Fake data
+        noise = torch.randn(real_data.size(0), nz, 1, 1, device=device)
+        fake_data = netG(noise)
+        label.fill_(fake_label)
+        output = netD(fake_data.detach()).view(-1)
+        lossD_fake = criterion(output, label)
+        lossD_fake.backward()
+        optimizerD.step()
+
+        ############################
+        # Update Generator
+        ############################
+        netG.zero_grad()
+        label.fill_(real_label)  # Generator wants discriminator to believe fake is real
+        output = netD(fake_data).view(-1)
+        lossG = criterion(output, label)
+        lossG.backward()
+        optimizerG.step()
+
+        # Print losses occasionally
+        if i % 100 == 0:
+            print(f'Epoch [{epoch}/{num_epochs}], Step [{i}/{len(dataloader)}], '
+                  f'Loss D: {lossD_real.item() + lossD_fake.item():.4f}, Loss G: {lossG.item():.4f}')
+
+    # Generate samples for visualization
+    with torch.no_grad():
+        fake = netG(fixed_noise).detach().cpu()
+    plt.imshow(vutils.make_grid(fake, padding=2, normalize=True).permute(1, 2, 0))
+    plt.show()
